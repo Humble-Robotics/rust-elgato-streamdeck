@@ -30,10 +30,11 @@
 //!
 //! Each connection owns a background reader thread: it answers the dock's keepalive frames
 //! (payload `[1, 10, …]` → ACK `[3, 26, connection_no]`), queues input reports, and routes
-//! `GET_REPORT` responses back to the blocked caller.
+//! `GET_REPORT` responses back to the blocked caller. The dock sends keepalives for the lifetime
+//! of a connection, so the reader treats `TIMEOUT` of silence as a lost link.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
@@ -141,6 +142,9 @@ impl Connection {
     fn connect(addr: SocketAddr) -> Result<Self, StreamDeckError> {
         let stream = TcpStream::connect_timeout(&addr, TIMEOUT)?;
         stream.set_nodelay(true)?;
+        // A peer that loses power or its route never closes the socket. Bound each read so the
+        // reader thread sees the silence.
+        stream.set_read_timeout(Some(TIMEOUT))?;
 
         let read_half = stream.try_clone()?;
         let shutdown_handle = stream.try_clone()?;
@@ -379,6 +383,7 @@ fn encode_frame(frame_flags: u16, frame_op: u8, message_id: u32, payload: &[u8])
 }
 
 /// Background reader: pulls bytes off the socket, reframes CORA packets, and dispatches them.
+/// Exits when the peer closes the socket or sends nothing for [`TIMEOUT`].
 fn reader_loop(shared: Arc<Shared>, mut stream: TcpStream) {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -393,11 +398,16 @@ fn reader_loop(shared: Arc<Shared>, mut stream: TcpStream) {
                 buf.extend_from_slice(&chunk[..n]);
                 process_buffer(&shared, &mut buf);
             }
+            // A signal interrupts a read that has a timeout. It says nothing about the link.
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            // Includes the read timeout: the peer sent nothing, not even a keepalive.
             Err(_) => break,
         }
     }
 
-    // Connection is gone: wake any waiters and fail outstanding requests.
+    // Connection is gone: fail any write blocked on the dead link, wake any waiters, and fail
+    // outstanding requests.
+    let _ = stream.shutdown(Shutdown::Both);
     {
         let (lock, cond) = &shared.connected;
         if let Ok(mut connected) = lock.lock() {
@@ -760,6 +770,48 @@ mod tests {
         assert!(matches!(transport.read_report(6, None), Err(StreamDeckError::Disconnected)));
 
         primary.join().unwrap();
+    }
+
+    /// A dock that goes silent without closing the socket (power loss, dropped route) must surface
+    /// as `Disconnected` once no keepalive arrives for `TIMEOUT`.
+    #[test]
+    fn read_report_errors_after_peer_goes_silent() {
+        let primary_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let primary_addr = primary_listener.local_addr().unwrap();
+        let child_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let child_port = child_listener.local_addr().unwrap().port();
+
+        let device2 = device2_payload(true, 0x0fd9, 0x0084, b"AB12CD34", child_port);
+        let primary = thread::spawn(move || {
+            let _sock = serve_primary_discovery(&primary_listener, &device2);
+            thread::sleep(Duration::from_millis(500));
+        });
+
+        let child = thread::spawn(move || {
+            let (mut sock, _) = child_listener.accept().unwrap();
+            sock.write_all(&keepalive_frame(1)).unwrap();
+            let mut ack = [0u8; HEADER_LEN + 32];
+            sock.read_exact(&mut ack).unwrap();
+            // Stay silent with the socket open. The read ends when the client gives up on the link.
+            let _ = sock.read(&mut [0u8; 1]);
+        });
+
+        let transport = CoraTransport::connect(primary_addr).unwrap();
+
+        // Poll like a caller's input loop until the link is reported lost.
+        let start = std::time::Instant::now();
+        let limit = TIMEOUT + Duration::from_secs(2);
+        let result = loop {
+            match transport.read_report(6, Some(Duration::from_millis(100))) {
+                Ok(_) if start.elapsed() < limit => continue,
+                result => break result,
+            }
+        };
+        assert!(matches!(result, Err(StreamDeckError::Disconnected)), "got {result:?} after {:?}", start.elapsed());
+        assert!(!transport.is_connected());
+
+        primary.join().unwrap();
+        child.join().unwrap();
     }
 
     /// Several frames arriving in a single TCP segment (keepalive + two input reports) must all be
